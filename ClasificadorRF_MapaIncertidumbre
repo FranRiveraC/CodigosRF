@@ -1,0 +1,470 @@
+// Cargar el shapefile subido como un FeatureCollection
+var area_estudio = ee.FeatureCollection('projects/ee-memoria/assets/Cuencas_buffer');
+
+// Estilizar los shapefiles para mostrar solo los contornos (sin relleno)
+var area_estudio_styled = area_estudio.style({color: 'blue', width: 2, fillColor: '00000000'});
+
+// Define el rango de fechas
+var startDate = '2023-01-01';
+var endDate = '2023-12-31';
+
+// Filtra la colección de imágenes Sentinel-2
+var sentinel2 = ee.ImageCollection('COPERNICUS/S2_HARMONIZED')
+    .filterBounds(area_estudio)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10)) // Filtra imágenes con menos del 10% de nubes
+    .select(['B2', 'B3', 'B4', 'B8','B8A','B11','B12']); // Selecciona las bandas de interés (Blue, Green, Red, NIR)
+
+//Sentinel 1 - Radar
+// Cargar Sentinel-1 ImageCollection.
+var sentinel1 = ee.ImageCollection("COPERNICUS/S1_GRD");
+
+var vh = sentinel1
+
+// Filter to get images with VV and VH dual polarization.
+  .filterDate('2023-01-01', '2023-12-31') //Filtro de fechas
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  // Filter to get images collected in interferometric wide swath mode.
+  .filter(ee.Filter.eq('instrumentMode', 'IW'));
+
+// Filter to get images from different look angles.
+var vhAscending = vh.filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'));
+var vhDescending = vh.filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
+
+var bandNames = ['VH', 'VV', 'VH_1'];
+
+var bandas_radar = vhAscending.select(['VH']).median()
+  .addBands(vhAscending.select(['VV']).merge(vhDescending.select(['VV'])).median())
+  .addBands(vhDescending.select(['VH']).median())
+  .rename(bandNames);
+
+var bandas_radar_image = ee.Image(bandas_radar).clip(area_estudio);
+Map.addLayer(bandas_radar_image, {min: [-25, -20, -25], max: [0, 10, 0]}, 'bandas_radar');
+
+// Calcula la mediana para el rango de fechas
+var medianImage = sentinel2.median().clip(area_estudio);
+
+// Cargar solo la banda de elevación del DEM y renombrarla (variables topo vienen en stack)
+var dem = ee.Image('projects/ee-memoria/assets/HuascoALOS').select('b1').rename('elevacion').clip(area_estudio);
+print(dem, 'Elevación DEM');
+
+// Función para calcular índices espectrales
+var addIndices = function(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI'); // Normalized Difference Vegetation Index
+  var wdvi = image.normalizedDifference(['B8', 'B3']).rename('WDVI'); // NDWI pero con otro nombre
+  var ndbi = image.normalizedDifference(['B12','B8']).rename('NDBI').double();// Normalized Difference Built Index
+  var savi = image.expression(
+    '((NIR - Red) / (NIR + Red + L)) * (1 + L)', {
+      'NIR': image.select('B8'), // NIR
+      'Red': image.select('B4'),  // Red
+      'L': 0.5 // Factor de ajuste para el suelo
+    }).rename('SAVI'); // Soil-Adjusted Vegetation Index
+    var ndsi = image.expression(
+  '(B3 - B11) / (B3 + B11)', {
+    'B3': image.select('B3'), // Green
+    'B11': image.select('B11') // SWIR1
+  }).rename('NDSI'); // Normalized Difference Snow Index
+  
+ ////INDICES QUE NO CARGARON
+  //var sbi = image.expression(
+  //  'B3 / (B3 + B4 + B8)', {
+  //    'B3': image.select('B3'), // Green
+  //    'B4': image.select('B4'), // Red
+  //    'B8': image.select('B8')  // NIR
+  //  }).rename('SBI'); // Soil Brightness Index
+  //var lui = image.expression(
+  //'((B8A - B11) / (B8A + B11)) * (B8A / B4)', {
+  //  'B8A': image.select('B8A'), // Red Edge
+  //  'B11': image.select('B11'), // SWIR1
+  //  'B4': image.select('B4')    // Red
+  //}).rename('LUI'); // Land Use Index
+  //var geoi = image.expression(
+  //'((B12 - B4) / (B12 + B4)) * (B12 / B2)', {
+  //  'B12': image.select('B12'), // SWIR2
+  //  'B4': image.select('B4'),   // Red
+  //  'B2': image.select('B2')    // Blue
+  //}).rename('GeoI'); // Geology Index
+
+  return image.addBands(ndvi).addBands(wdvi).addBands(ndbi).addBands(savi).addBands(ndsi);
+};
+
+// Aplica la función addIndices sobre la colección de imágenes
+var ind = sentinel2.map(addIndices);
+
+// Aplicación de reductor a índices
+var ind_reductor = ind.median().clip(area_estudio);
+print(ind_reductor, 'Mediana Indices');
+
+// Cargar y renombrar las variables morfométricas
+var slope = ee.Image('projects/ee-memoria/assets/Morfo/Slope').rename('Slope');
+var aspect = ee.Image('projects/ee-memoria/assets/Morfo/Aspect').rename('Aspect');
+var analytical_hillshading = ee.Image('projects/ee-memoria/assets/Morfo/Analytical_Hillshading').rename('Analytical_Hillshading');
+var curvature = ee.Image('projects/ee-memoria/assets/Morfo/Curvature_Classification').rename('Curvature');
+var catchment = ee.Image('projects/ee-memoria/assets/Morfo/Catchment_Area').rename('Catchment');
+var convergence2x2 = ee.Image('projects/ee-memoria/assets/Morfo/Convergence_Index_2x2').rename('Convergence_2x2');
+var convexity = ee.Image('projects/ee-memoria/assets/Morfo/Convexity').rename('Convexity');
+var flow_acc = ee.Image('projects/ee-memoria/assets/Morfo/Flow_Accumulation').rename('Flow_Accumulation');
+var flow_dir = ee.Image('projects/ee-memoria/assets/Morfo/Flow_Directions').rename('Flow_Direction');
+var geomorphons = ee.Image('projects/ee-memoria/assets/Morfo/Geomorphons').rename('Geomorphons');
+var hill_index = ee.Image('projects/ee-memoria/assets/Morfo/Hill_Index').rename('Hill_Index');
+var hillshade = ee.Image('projects/ee-memoria/assets/Morfo/Hillshade').rename('Hillshade');
+var hillslope_index = ee.Image('projects/ee-memoria/assets/Morfo/Hillslope_Index').rename('Hillslope_Index');
+var landforms = ee.Image('projects/ee-memoria/assets/Morfo/Landforms').rename('Landforms');
+var landforms_ip = ee.Image('projects/ee-memoria/assets/Morfo/Landforms_IP').rename('Landforms_IP');
+var mbi = ee.Image('projects/ee-memoria/assets/Morfo/MBI_prueba').rename('MBI');
+var mrrtf = ee.Image('projects/ee-memoria/assets/Morfo/MRRTF').rename('MRRTF'); // Multi-Resolution Ridge Top Flatness
+var mrvbf = ee.Image('projects/ee-memoria/assets/Morfo/MRVBF').rename('MRVBF'); // Multi-Resolution Valley Bottom Flatness
+var maximal_curvature = ee.Image('projects/ee-memoria/assets/Morfo/Maximal_Curvature').rename('Maximal_Curvature');
+var maximum_height = ee.Image('projects/ee-memoria/assets/Morfo/Maximum_Height').rename('Maximum_Height');
+var melton_ruggedness = ee.Image('projects/ee-memoria/assets/Morfo/Melton_Ruggedness').rename('Melton_Ruggedness');
+var spi = ee.Image('projects/ee-memoria/assets/Morfo/SPI').rename('SPI'); // Stream Power Index
+var slope_grados = ee.Image('projects/ee-memoria/assets/Morfo/Slope_grados').rename('Slope_Grados');
+var tobia = ee.Image('projects/ee-memoria/assets/Morfo/TOBIA_classes').rename('TOBIA');
+var tpi = ee.Image('projects/ee-memoria/assets/Morfo/TPI').rename('TPI'); // Topographic Position Index
+var tri = ee.Image('projects/ee-memoria/assets/Morfo/TRI').rename('TRI'); // Terrain Ruggedness Index
+var tsc = ee.Image('projects/ee-memoria/assets/Morfo/TSC').rename('TSC'); // Terrain Surface Classification
+var texture = ee.Image('projects/ee-memoria/assets/Morfo/Texture').rename('Texture');
+var vrm = ee.Image('projects/ee-memoria/assets/Morfo/VRM').rename('VRM'); // Vector Ruggedness Measure
+var valley_index = ee.Image('projects/ee-memoria/assets/Morfo/Valley_Index').rename('Valley_Index');
+
+// Agrupar todas las variables en una sola imagen
+var varMorfo = ee.Image([])
+  .addBands(slope)
+  .addBands(aspect)
+  .addBands(analytical_hillshading)
+  .addBands(curvature)
+  .addBands(catchment)
+  .addBands(convergence2x2)
+  .addBands(convexity)
+  .addBands(flow_acc)
+  .addBands(flow_dir)
+  .addBands(geomorphons)
+  .addBands(hillshade)
+  .addBands(hill_index)
+  .addBands(hillslope_index)
+  .addBands(landforms)
+  .addBands(landforms_ip)
+  .addBands(mbi)
+  .addBands(mrrtf)
+  .addBands(mrvbf)
+  .addBands(maximal_curvature)
+  .addBands(maximum_height)
+  .addBands(melton_ruggedness)
+  .addBands(spi)
+  .addBands(slope_grados)
+  .addBands(tobia)
+  .addBands(tpi)
+  .addBands(tri)
+  .addBands(tsc)
+  .addBands(texture)
+  .addBands(vrm)
+  .addBands(valley_index);
+
+
+// Mostrar las bandas agrupadas
+print('Variables morfométricas agrupadas', varMorfo);
+
+// Unir Predictores: Bandas Sentinel-2 + índices + DEM + variables morfométricas
+var bandas = ee.Image.cat([medianImage, ind_reductor, dem, varMorfo, bandas_radar]);
+
+// Obtener los nombres de las bandas de las variables morfométricas
+var morfoBandNames = varMorfo.bandNames();
+
+// Concatenar las bandas Sentinel-2, índices, DEM, y nombres de las bandas morfométricas
+var bandas_clasificacion = ['B2', 'B3', 'B4', 'B8', 'NDVI', 'WDVI', 'NDBI', 'SAVI', 'NDSI', 'elevacion','VH', 'VV']
+                            .concat(morfoBandNames.getInfo());
+
+// Imprimir el resultado de las bandas para clasificación
+print('Bandas para clasificación:', bandas_clasificacion);
+
+
+// Calcula la mediana de la colección con los índices
+//var medianWithIndices = withIndices.median().clip(area_estudio);
+//print(medianWithIndices, 'Mediana con índices');
+
+// Seleccionar las bandas RGB y escalarlas
+var rgbVis = {
+  min: 0,
+  max: 4500,
+  bands: ['B4', 'B3', 'B2'],
+};
+
+// Visualizar la imagen
+Map.addLayer(medianImage, rgbVis, 'Imagen Sentinel 2');
+
+// Muestra el área de estudio en el mapa
+Map.centerObject(area_estudio, 10);
+Map.addLayer(area_estudio_styled, {}, 'Área de estudio');
+
+// Cargar el shapefile subido
+var puntos_class_fc1 = ee.FeatureCollection('projects/ee-memoria/assets/puntos_clv2');
+
+print(puntos_class_fc1, 'Puntos cargados');
+
+// Filtrar la FeatureCollection por el límite espacial, 
+//para evitar que hayan puntos fuera del área de estudio
+var puntos_class_fc = puntos_class_fc1.filterBounds(area_estudio);
+
+Map.addLayer(puntos_class_fc, {}, 'Puntos de muestreo');
+
+// Explorar los datos cargados
+print(puntos_class_fc, 'Puntos de entrenamiento');
+
+// Filtrar las clases según esquema
+var agua = puntos_class_fc.filter(ee.Filter.eq('id', 'Agua'));
+var glaciar = puntos_class_fc.filter(ee.Filter.eq('id', 'Glaciar'));
+//var gravas = puntos_class_fc.filter(ee.Filter.eq('id', 'Gravas')); se unifico a Mpla
+var aluvialReciente = puntos_class_fc.filter(ee.Filter.eq('id', 'Ha'));
+var antropico = puntos_class_fc.filter(ee.Filter.eq('id', 'Han'));
+var aluvialMioceno = puntos_class_fc.filter(ee.Filter.eq('id', 'Mpla'));
+var glaciales = puntos_class_fc.filter(ee.Filter.eq('id', 'Plgm'));
+var aluvialPlioceno = puntos_class_fc.filter(ee.Filter.eq('id', 'PlHa'));
+var coluvialPlioceno = puntos_class_fc.filter(ee.Filter.eq('id', 'PlHc'));
+var eolicoInactivo = puntos_class_fc.filter(ee.Filter.eq('id', 'PlHe1')); //no aparece en área
+var eolicoActivo = puntos_class_fc.filter(ee.Filter.eq('id', 'PlHe2'));  //no aparece en área
+//var fluvialInactivo = puntos_class_fc.filter(ee.Filter.eq('id', 'PlHf1')); se unificó a PlHf2
+var fluvialActivo = puntos_class_fc.filter(ee.Filter.eq('id', 'PlHf2')); 
+var litoralInactivo = puntos_class_fc.filter(ee.Filter.eq('id', 'PlHl1')); //no aparece en área
+var litoralActivo = puntos_class_fc.filter(ee.Filter.eq('id', 'PlHl2'));  //no aparece en área
+var periglaciares = puntos_class_fc.filter(ee.Filter.eq('id', 'PlHpg'));
+var remociones = puntos_class_fc.filter(ee.Filter.eq('id', 'PlHrm'));
+var roca = puntos_class_fc.filter(ee.Filter.eq('id', 'Roca'));
+var vegetacion = puntos_class_fc.filter(ee.Filter.eq('id', 'Vegetación'));
+
+
+// Extraer información desde las bandas a partir de los puntos
+var puntos_banda_clas = bandas
+  .select(bandas_clasificacion)
+  .sampleRegions({
+    collection: puntos_class_fc, 
+    properties: ['id'],
+    scale: 10
+  });
+
+// Preparación puntos
+print(puntos_banda_clas, 'Puntos clase');
+
+// Partición de los datos: 70% entrenamiento y 30% control  
+var trainingTesting = puntos_banda_clas.randomColumn();
+var trainingSet = trainingTesting.filter(ee.Filter.lessThan('random', 0.7));
+print(trainingSet, 'Training set');
+
+var testingSet = trainingTesting.filter(ee.Filter.greaterThanOrEquals('random', 0.7));   
+print(testingSet, 'Testing set'); 
+
+// Clasificación con Random Forest 
+var clasificadorRF = ee.Classifier.smileRandomForest(800).train({
+  features: trainingSet,
+  classProperty: 'id',
+  inputProperties: bandas_clasificacion
+});
+
+// Clasificar imagen
+var clasificadaRF = bandas.classify(clasificadorRF);
+
+// Aplicar un filtro de mayoría para suavizar la clasificación
+var majorityFiltered = clasificadaRF.focal_mode(1);
+
+// Carga de clasificación en mapa
+Map.addLayer(majorityFiltered, {min: 0, max: 18, palette:['#108bff', // Agua
+                                                       '#af4fcb', // Glaciar
+                                                      // '#69ff14', // Gravas
+                                                       '#81a1a2', // Aluvial Reciente
+                                                       '#b2c094', // Antropico
+                                                       '#b5f6ff', // Aluvial Mioceno
+                                                       '#981515', // Glaciales
+                                                       '#efaf73', // Aluvial Plioceno
+                                                       '#ffffff', // Coluvial Plioceno
+                                                       '#c2c2c2', // Eólico Inactivo
+                                                       '#ff0000', // Eólico Activo
+                                                      //'#0000ff', // Fluvial Inactivo
+                                                       '#00ff00', // Fluvial Activo
+                                                       '#ffa500', // Litoral Inactivo
+                                                       '#ffff00', // Litoral Activo
+                                                       '#9e005d', // Periglaciares
+                                                       '#de3b39', // Remociones
+                                                       '#000000', // Roca
+                                                       '#b89991'  // Vegetación
+                                                      ]}, 'Clasificación RF');
+
+
+// Calcular la importancia de las variables
+var importanciaVariables = ee.Dictionary(clasificadorRF.explain().get('importance'));
+print('Importancia de las variables:', importanciaVariables);
+
+// Convertir a una lista para visualizar la importancia en formato FeatureCollection
+var importanciaLista = importanciaVariables.keys().map(function(variable) {
+  return ee.Feature(null, {
+    'Variable': variable,
+   'Importancia': importanciaVariables.get(variable)
+  });
+});
+
+var importanciaFC = ee.FeatureCollection(importanciaLista);
+print('Importancia de las variables (lista):', importanciaFC);
+
+// Validación del modelo con la matriz de confusión
+var confusionMatrix = ee.ConfusionMatrix(testingSet.classify(clasificadorRF)
+  .errorMatrix({
+    actual: 'id', 
+    predicted: 'classification'
+  })
+);
+  
+var pg = confusionMatrix.accuracy();
+var pu = confusionMatrix.consumersAccuracy();
+var pp = confusionMatrix.producersAccuracy();
+var k = confusionMatrix.kappa();
+
+print('Matriz de confusión: ', confusionMatrix);
+print('Precisión general: ', pg);
+print('Precisión del productor: ', pp);
+print('Precisión del consumidor: ', pu);
+print('Kappa: ', k);
+
+// Exportación de datos
+// Exporta imagen Sentinel 2 (mediana) a Google Drive
+Export.image.toDrive({
+  image: medianImage.float(),
+  description: 'Exportar_Sentinel2',
+  fileNamePrefix: 'Sentinel2_mediana',
+  scale: 10, // Resolución en metros
+  region: area_estudio,
+  maxPixels: 1e13, // Número máximo de píxeles permitidos
+});
+
+// Exporta imagen con clasificación a Google Drive
+Export.image.toDrive({
+  image: majorityFiltered, // Cambiado a majorityFiltered
+  description: 'Exportar_clasificacion',
+  scale: 10,
+  fileNamePrefix: 'Clasificacion',
+  region: area_estudio,
+  maxPixels: 1e13,
+});
+
+// CÁLCULO DE IMPORTANCIA POR CLASE
+// ------------------------------------------------------------
+
+// 1. Obtener lista de clases únicas
+var clases = puntos_class_fc.aggregate_array("id").distinct().sort();
+print('Clases únicas:', clases);
+
+// 2. Función para calcular importancia por clase
+var calcularImportanciaPorClase = function(clase) {
+  // Crear propiedad binaria (1 para la clase actual, 0 para otras)
+  var trainingDataBinario = trainingSet.map(function(feature) {
+    var isClass = ee.String(feature.get('id')).compareTo(clase).eq(0);
+    return feature.set('target', isClass);
+  });
+  
+  // Entrenar modelo binario
+  var modeloBinario = ee.Classifier.smileRandomForest(800)
+    .train({
+      features: trainingDataBinario,
+      classProperty: 'target',
+      inputProperties: bandas_clasificacion
+    });
+  
+  // Calcular importancia de variables
+  var importancia = ee.Dictionary(modeloBinario.explain().get('importance'));
+  
+  return ee.Feature(null, {
+    'Clase': clase,
+    'Importancia': importancia
+  });
+};
+
+// 3. Calcular importancia para todas las clases
+var importanciaPorClase = ee.FeatureCollection(clases.map(calcularImportanciaPorClase));
+
+// 4. Exportar resultados
+print('Importancia por clase:', importanciaPorClase);
+
+// Exportar tabla a Drive (opcional)
+Export.table.toDrive({
+  collection: importanciaPorClase,
+  description: 'Exportar_importancia_por_clase',
+  fileNamePrefix: 'Importancia_por_Clase',
+  fileFormat: 'CSV'
+});
+
+
+// Exportar precisiones
+// Preparación datos
+var sta = ee.Feature(null, {
+  CM: confusionMatrix,
+  PG: pg,
+  PU: pu.toList(),
+  PP: pp.toList(),
+  kappa: k
+}); 
+
+var accuracy = ee.FeatureCollection(sta);
+
+// Exportar tabla de precisiones a Google Drive
+Export.table.toDrive({
+  collection: accuracy,
+  description: 'Exportar_precision',
+  fileNamePrefix:'Precision', 
+  fileFormat: 'CSV'
+});    
+
+////////////////
+
+// --- Cálculo de incertidumbre usando entropía ---
+
+// Reentrenar clasificador en modo MULTIPROBABILITY
+var clasificadorEntropia = ee.Classifier.smileRandomForest(800)
+  .setOutputMode('MULTIPROBABILITY')
+  .train({
+    features: trainingSet,
+    classProperty: 'id',
+    inputProperties: bandas_clasificacion
+  });
+
+// Clasificación con probabilidades por clase
+var clasificadaProb = bandas.classify(clasificadorEntropia);
+
+// Obtener clases únicas para nombrar las bandas de salida
+var etiquetasClases = puntos_class_fc.aggregate_array("id").distinct().sort();
+// Convertir los valores numéricos a strings
+var etiquetasClasesList = etiquetasClases.map(function(id){
+  return ee.String(id); // Convertir cada id numérico a string
+});
+
+// Aplanar arreglo de probabilidades a bandas individuales
+var probasPorClase = clasificadaProb.arrayFlatten([etiquetasClasesList]);
+
+// Calcular log(probabilidad)
+var logProbs = probasPorClase.log();
+
+// Calcular entropía: -Σ(p * log(p))
+var entropy = probasPorClase.multiply(logProbs).reduce(ee.Reducer.sum()).multiply(-1);
+
+// Visualizar en el mapa
+Map.addLayer(entropy, {min: 0, max: 2, palette: ['white', 'yellow', 'red']}, 'Entropía');
+
+// --- Extraer incertidumbre a los puntos de entrenamiento ---
+
+var puntosConEntropia = puntos_class_fc.map(function(pt) {
+  var valor = entropy.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: pt.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  }).get('sum'); // 'sum' es el nombre de la banda generada por el reducer
+
+  return pt.set('entropia', valor);
+});
+
+print('Puntos con entropía:', puntosConEntropia);
+
+// Exportar puntos con entropía a Drive
+Export.table.toDrive({
+  collection: puntosConEntropia,
+  description: 'Puntos_con_Entropia',
+  fileNamePrefix: 'Entropia_Puntos',
+  fileFormat: 'CSV'
+});
